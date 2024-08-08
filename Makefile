@@ -1,6 +1,6 @@
 PLUGIN_SOURCE_FILES= plugin.cc
 
-CXXFLAGS += -ggdb3 -Wall -Wextra
+CXXFLAGS += -ggdb3 -Wall -Wextra -std=c++20
 
 plugin.so:HOST_GCC=g++
 plugin.so:TARGET_GCC=gcc

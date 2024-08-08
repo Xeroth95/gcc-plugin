@@ -5,6 +5,7 @@
 #include <unordered_set>
 #include <vector>
 #include <cassert>
+#include <span>
 
 #include <gcc-plugin.h>
 #include <plugin-version.h>
@@ -28,6 +29,9 @@
 #include <tree-pass.h>
 
 #include <stringpool.h>
+
+
+int i = (location_t) 0;
 
 int plugin_is_GPL_compatible;
 
@@ -356,11 +360,9 @@ std::unordered_map<basic_block, block_info> build_block_infos(
 		block_info& info = block_infos[current];
 
 
-		gimple_stmt_iterator si;
 		printf("---  start block %d --- \n", current->index);
-		for (si = gsi_start_bb(current);
-		     !gsi_end_p(si);
-		     gsi_next(&si)) {
+		for (gimple_stmt_iterator si = gsi_start_bb(current);
+		     !gsi_end_p(si); gsi_next(&si)) {
 			gimple* stmt = gsi_stmt(si);
 
 			handle_gimple(info, stmt, ctx);
@@ -380,6 +382,101 @@ struct state {
 	std::unordered_map<tree, location_t> tracked;
 	basic_block block{nullptr};
 };
+
+std::pair<location_t, location_t> block_bounds(basic_block b)
+{
+	location_t start{}, end{};
+
+	bool first = true;
+
+	for (gimple_stmt_iterator si = gsi_start_bb(b);
+	     !gsi_end_p(si); gsi_next(&si)) {
+		gimple* stmt = gsi_stmt(si);
+
+		if (first) {
+			start = gimple_location(stmt);
+			first = false;
+		}
+
+		end = gimple_location(stmt);
+	}
+	// for (block_stmt_iterator si = bsi_start(b);
+	//      !bsi_end_p(si); bsi_next(&si)) {
+	// }
+	return { start, end };
+}
+
+location_t block_start(basic_block b)
+{
+	for (gimple_stmt_iterator si = gsi_start_bb(b);
+	     !gsi_end_p(si); gsi_next(&si)) {
+		gimple* stmt = gsi_stmt(si);
+
+		location_t loc = gimple_location(stmt);
+		if (loc != UNKNOWN_LOCATION) {
+			return loc;
+		}
+	}
+	return UNKNOWN_LOCATION;
+}
+
+location_t last_untrack_pos(std::span<const state> stack,
+			    tree var,
+			    const std::unordered_map<basic_block, block_info>& infos)
+{
+	for (size_t i = stack.size(); i > 0;) {
+
+		i -= 1;
+
+		auto& state = stack[i];
+		basic_block block = state.block;
+		auto& info = infos.at(block);
+
+		auto found = info.seen.find(var);
+
+		if (found == info.seen.end()) { continue; }
+
+		auto& status = found->second;
+		assert(!status.tracked &&
+		       "supposed untracked variable is somehow last seen as tracked");
+
+		// so this variable was last seen in this block
+		// and it is untracked, so we know that the last time it was
+
+		return status.last_changed;
+
+	}
+
+	// this should not happen
+
+	assert(!"Untracked var was never untracked !?");
+
+	return UNKNOWN_LOCATION;
+}
+
+void inconsistent_tracking_error(
+	basic_block b,
+	tree var,
+	location_t tracked_loc,
+	location_t untracked_loc)
+{
+	auto start = block_start(b);
+	ident name = DECL_NAME(var);
+
+	rich_location loc{ nullptr, start, nullptr };
+
+	loc.add_range(tracked_loc,
+		      SHOW_LINES_WITHOUT_RANGE,
+		      &PREVIOUSLY_TRACKED);
+
+	loc.add_range(untracked_loc,
+		      SHOW_LINES_WITHOUT_RANGE,
+		      &PREVIOUSLY_UNTRACKED);
+
+	error_at(&loc,
+		 "Inconsistent tracking status of variable %s; only sometimes tracked at some (not this) point",
+		 IDENTIFIER_POINTER(name));
+}
 
 void violations_recurse(std::vector<state> stack,
 			const std::unordered_map<basic_block, block_info>& infos,
@@ -404,8 +501,6 @@ void violations_recurse(std::vector<state> stack,
 
 		for (auto [key, location] : last.tracked) {
 			if (tracked_vars_at_point.erase(key) == 0) {
-				ident name = DECL_NAME(key);
-
 				// situation:
 				// we are about to enter block current
 				// last tracks key
@@ -420,22 +515,30 @@ void violations_recurse(std::vector<state> stack,
 				// the track in last->block
 				// the untrack in b
 
+				// todo: this needs to be a different function
+				//       think about what is actually happening here
+				location_t untrack_pos = last_untrack_pos(stack,
+									  key,
+									  infos);
 
+				inconsistent_tracking_error(current, key,
+							    location,
+							    untrack_pos);
 
-				// TODO: backtrace
-				error_at(location,
-					 "Inconsistent tracking status of variable %s; only sometimes tracked at some (not this) point", IDENTIFIER_POINTER(name));
+				return;
 			}
 		}
 
 		for (auto var : tracked_vars_at_point) {
-			ident name = DECL_NAME(var);
+			location_t untrack_pos = last_untrack_pos(stack,
+								  var,
+								  infos);
 
-			// see above, but switched roles
-
-			error_at(parent.tracked[var],
-"Inconsistent tracking status of variable %s; only sometimes tracked at some (not this) point", IDENTIFIER_POINTER(name)
-				);
+			inconsistent_tracking_error(current,
+						    var,
+						    parent.tracked[var],
+						    untrack_pos);
+			return;
 		}
 
 		return;
@@ -494,6 +597,8 @@ void violations_recurse(std::vector<state> stack,
 
 		}
 	}
+
+	// TODO: if reached end, make sure that nothing is still tracked
 
 	edge e;
 	edge_iterator ei;

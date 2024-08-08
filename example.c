@@ -23,10 +23,10 @@ int main(int argc, char* argv[])
 	}
 
 	int y = 2;
-	track(y);
 	for (int i = 0; i < 10; ++i) {
-		untrack(y);
+		track(y);
 	}
+	untrack(y);
 
 	untrack(x);
 	return 0;
