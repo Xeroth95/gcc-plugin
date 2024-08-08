@@ -22,8 +22,10 @@ int main(int argc, char* argv[])
 		untrack(x);
 	}
 
+	int y = 2;
+	track(y);
 	for (int i = 0; i < 10; ++i) {
-		track(i);
+		untrack(y);
 	}
 
 	untrack(x);

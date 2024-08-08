@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <cassert>
 
 #include <gcc-plugin.h>
 #include <plugin-version.h>
@@ -377,76 +378,121 @@ std::unordered_map<basic_block, block_info> build_block_infos(
 
 struct state {
 	std::unordered_map<tree, location_t> tracked;
-	std::unordered_set<basic_block> visited;
-
-	state copy() const {
-		return *this;
-	}
+	basic_block block{nullptr};
 };
 
-void violations_recurse(const state* parent,
+void violations_recurse(std::vector<state> stack,
 			const std::unordered_map<basic_block, block_info>& infos,
-			basic_block current
-		       )
+			basic_block current)
 {
+	assert(stack.size() > 0);
+	auto& last = stack.back();
+	for (size_t i = 0; i < stack.size() - 1; ++i) {
+		auto& parent = stack[i];
+		auto& child  = stack[i+1];
+		if (child.block != current) {
+			continue;
+		}
 
-	if (parent->visited.find(current) != parent->visited.end()) {
-		// we were already here
-		// TODO: check that everything is the same
-		printf("already visited %d\n", current->index);
+		// so we already reached this point.  We need to make sure
+		// that the same variables are currently tracked, so that
+		// the input of each block is always well defined
+		std::unordered_set<tree> tracked_vars_at_point;
+		for (auto [key, _] : parent.tracked) {
+			tracked_vars_at_point.insert(key);
+		}
+
+		for (auto [key, location] : last.tracked) {
+			if (tracked_vars_at_point.erase(key) == 0) {
+				ident name = DECL_NAME(key);
+
+				// situation:
+				// we are about to enter block current
+				// last tracks key
+				// parent does not track key
+
+				// so there is a block b between
+				// last->block and parent->block, which
+				// untracks var.
+
+				// we should print:
+				// error at the block current (+ error msg)
+				// the track in last->block
+				// the untrack in b
+
+
+
+				// TODO: backtrace
+				error_at(location,
+					 "Inconsistent tracking status of variable %s; only sometimes tracked at some (not this) point", IDENTIFIER_POINTER(name));
+			}
+		}
+
+		for (auto var : tracked_vars_at_point) {
+			ident name = DECL_NAME(var);
+
+			// see above, but switched roles
+
+			error_at(parent.tracked[var],
+"Inconsistent tracking status of variable %s; only sometimes tracked at some (not this) point", IDENTIFIER_POINTER(name)
+				);
+		}
+
 		return;
 	}
+
 	// *every* block has an info
 	auto& info = infos.at(current);
+	if (!info.empty()) {
 
-	// we need to check that no newly tracked var was already tracked
-	// and that every newly untracked var was already tracked
-	for (auto& varloc : info.newly_tracked) {
-		auto found = parent->tracked.find(varloc.id);
+		// we need to check that no newly tracked var was already tracked
+		// and that every newly untracked var was already tracked
+		for (auto& varloc : info.newly_tracked) {
+			auto found = last.tracked.find(varloc.id);
 
-		if (found != parent->tracked.end()) {
-			// TODO: error backtrace
+			if (found != last.tracked.end()) {
+				// TODO: error backtrace
 
-			rich_location location{
-				nullptr, varloc.loc, &NEWLY_TRACKED
-			};
+				rich_location location{
+					nullptr, varloc.loc, &NEWLY_TRACKED
+				};
 
-			location.add_range(found->second,
-					   SHOW_LINES_WITHOUT_RANGE,
-					   &PREVIOUSLY_TRACKED
-					  );
-			error_at(&location,
-				 "Cannot track already tracked variable");
-		}
-	}
-
-	for (auto& varloc : info.newly_untracked) {
-		auto found = parent->tracked.find(varloc.id);
-
-		if (found == parent->tracked.end()) {
-			// error (backtrack)
-			rich_location location{
-				nullptr, varloc.loc, &NEWLY_UNTRACKED
-			};
-
-			error_at(&location,
-				 "Cannot untrack variable that is not tracked");
-		}
-	}
-
-	// new we need to merge the seen status of info into our state
-
-	auto state_ = parent->copy(); // todo: only copy if !info.empty()
-	auto* state = &state_;
-	state->visited.insert(current);
-
-	for (auto& [var, status] : info.seen) {
-		if (status.tracked) {
-			state->tracked[var] = status.last_changed;
-		} else {
-			state->tracked.erase(var);
+				location.add_range(found->second,
+						   SHOW_LINES_WITHOUT_RANGE,
+						   &PREVIOUSLY_TRACKED
+						  );
+				error_at(&location,
+					 "Cannot track already tracked variable");
+			}
 		}
 
+		for (auto& varloc : info.newly_untracked) {
+			auto found = last.tracked.find(varloc.id);
+
+			if (found == last.tracked.end()) {
+				// error (backtrack)
+				rich_location location{
+					nullptr, varloc.loc, &NEWLY_UNTRACKED
+				};
+
+				error_at(&location,
+					 "Cannot untrack variable that is not tracked");
+			}
+		}
+
+		// new we need to merge the seen status of info into our state
+
+		auto& state = stack.emplace_back(last);
+		state.block = current;
+
+		for (auto& [var, status] : info.seen) {
+			if (status.tracked) {
+				state.tracked[var] = status.last_changed;
+			} else {
+				state.tracked.erase(var);
+			}
+
+		}
 	}
 
 	edge e;
@@ -455,7 +501,7 @@ void violations_recurse(const state* parent,
 		printf("--- edge %d -> %d\n",
 		       current->index,
 		       e->dest->index);
-		violations_recurse(state,
+		violations_recurse(stack,
 				   infos,
 				   e->dest);
 	}
@@ -466,9 +512,21 @@ void violations_recurse(const state* parent,
 void find_violations(const std::unordered_map<basic_block, block_info>& infos,
 		     basic_block start)
 {
-	state initial;
+	std::vector<state> stack;
+	auto& initial = stack.emplace_back();
+	initial.block = start;
 
-	violations_recurse(&initial, infos, start);
+
+	edge e;
+	edge_iterator ei;
+	FOR_EACH_EDGE(e, ei, start->succs) {
+		printf("--- edge %d -> %d\n",
+		       start->index,
+		       e->dest->index);
+		violations_recurse(stack,
+				   infos,
+				   e->dest);
+	}
 }
 
 unsigned int tso::execute(function* f) {
