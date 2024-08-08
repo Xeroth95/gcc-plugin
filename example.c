@@ -9,17 +9,23 @@ int main(int argc, char* argv[])
 	track(x);
 	{
 		int x = argc;
-		track(x);
+		// track(x);
 		track(x);
 		//track(1);
 		if (argc) {
 			// comment
+			//untrack(argc);
 			return 1;
 		}
 		x = f();
 		//untrack(untrack(x));
 		untrack(x);
 	}
+
+	for (int i = 0; i < 10; ++i) {
+		track(i);
+	}
+
 	untrack(x);
 	return 0;
 }

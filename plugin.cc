@@ -232,6 +232,21 @@ struct context {
 	ident track, untrack;
 };
 
+bool is_variable(tree t)
+{
+	switch (TREE_CODE(t)) {
+	case FIELD_DECL: // structure field (?)
+	case VAR_DECL: // variable
+		//case CONST_DECL:
+	case PARM_DECL: // (function) parameter
+		// case TYPE_DECL:
+	case RESULT_DECL: // no idea
+		return true;
+	default:
+		return false;
+	}
+}
+
 void start_tracking(block_info& current,
 		    gimple* st)
 {
@@ -244,8 +259,8 @@ void start_tracking(block_info& current,
 
 	tree arg = gimple_call_arg(st, 0);
 
-	if (TREE_CODE(arg) != VAR_DECL ||
-	    DECL_ARTIFICIAL(arg)) {
+	// artificial = temporary that was inserted by compiler
+	if (!is_variable(arg) || DECL_ARTIFICIAL(arg)) {
 		error_at(loc, "can only track variables");
 		return;
 	}
@@ -268,8 +283,12 @@ void stop_tracking(block_info& current, gimple* st)
 
 	tree arg = gimple_call_arg(st, 0);
 
-	if (TREE_CODE(arg) != VAR_DECL ||
-	    DECL_ARTIFICIAL(arg)) {
+	if (!is_variable(arg) || DECL_ARTIFICIAL(arg)) {
+
+		printf("code = %d (%d); artificial = %s\n",
+		       TREE_CODE(arg), VAR_DECL, DECL_ARTIFICIAL(arg) ? "yes" : "no"
+		      );
+
 		error_at(loc, "can only untrack variables");
 		return;
 	}
@@ -337,7 +356,7 @@ std::unordered_map<basic_block, block_info> build_block_infos(
 
 
 		gimple_stmt_iterator si;
-		printf("---  start block --- \n");
+		printf("---  start block %d --- \n", current->index);
 		for (si = gsi_start_bb(current);
 		     !gsi_end_p(si);
 		     gsi_next(&si)) {
@@ -345,13 +364,13 @@ std::unordered_map<basic_block, block_info> build_block_infos(
 
 			handle_gimple(info, stmt, ctx);
 		}
-		printf("---  end block --- \n");
+		printf("---  end block %d --- \n", current->index);
 
 		current = current->next_bb;
 	}
 
 	// give an empty block to end
-	block_infos.emplace(end);
+	block_infos.emplace(end, block_info{});
 
 	return block_infos;
 }
@@ -365,81 +384,80 @@ struct state {
 	}
 };
 
-void violations_recurse(const state& parent,
+void violations_recurse(const state* parent,
 			const std::unordered_map<basic_block, block_info>& infos,
 			basic_block current
 		       )
 {
+
+	if (parent->visited.find(current) != parent->visited.end()) {
+		// we were already here
+		// TODO: check that everything is the same
+		printf("already visited %d\n", current->index);
+		return;
+	}
 	// *every* block has an info
 	auto& info = infos.at(current);
-
-	auto state = parent.copy(); // todo: only copy if !info.empty()
 
 	// we need to check that no newly tracked var was already tracked
 	// and that every newly untracked var was already tracked
 	for (auto& varloc : info.newly_tracked) {
-		auto found = state.tracked.find(varloc.id);
+		auto found = parent->tracked.find(varloc.id);
 
-		if (found != state.tracked.end()) {
+		if (found != parent->tracked.end()) {
 			// TODO: error backtrace
 
 			rich_location location{
-				nullptr, varloc.loc, &NEWLY_UNTRACKED
+				nullptr, varloc.loc, &NEWLY_TRACKED
 			};
 
 			location.add_range(found->second,
 					   SHOW_LINES_WITHOUT_RANGE,
-					   &PREVIOUSLY_UNTRACKED
+					   &PREVIOUSLY_TRACKED
 					  );
-			error_at(location,
-				 "Cannot track already tracked value\n");
+			error_at(&location,
+				 "Cannot track already tracked variable");
 		}
 	}
 
-	for (auto& varloc : info.newly_tracked) {
-		auto found = state.tracked.find(varloc.id);
+	for (auto& varloc : info.newly_untracked) {
+		auto found = parent->tracked.find(varloc.id);
 
-		if (found == state.tracked.end()) {
+		if (found == parent->tracked.end()) {
 			// error (backtrack)
+			rich_location location{
+				nullptr, varloc.loc, &NEWLY_UNTRACKED
+			};
+
+			error_at(&location,
+				 "Cannot untrack variable that is not tracked");
 		}
 	}
 
 	// new we need to merge the seen status of info into our state
 
+	auto state_ = parent->copy(); // todo: only copy if !info.empty()
+	auto* state = &state_;
+	state->visited.insert(current);
+
 	for (auto& [var, status] : info.seen) {
-
-	}
-
-	for (auto& [var, track_loc] : state.tracked) {
-
-
-	}
-
-	if (parent.visited.find(current) != parent.visited.end()) {
-		// we were already here
-		return;
-	}
-
-	if (auto found = infos.find(current); found != infos.end()) {
-		// https://gcc.gnu.org/onlinedocs/gccint/Edges.html
-
-
-
-		edge e;
-		edge_iterator ei;
-		FOR_EACH_EDGE(e, ei, current->succs) {
-			violations_recurse(current,
-					   infos,
-					   e.dest);
+		if (status.tracked) {
+			state->tracked[var] = status.last_changed;
+		} else {
+			state->tracked.erase(var);
 		}
-	} else {
-		edge e;
-		edge_iterator ei;
-		FOR_EACH_EDGE(e, ei, current->succs) {
-			violations_recurse(parent,
-					   infos,
-					   e.dest);
-		}
+
+	}
+
+	edge e;
+	edge_iterator ei;
+	FOR_EACH_EDGE(e, ei, current->succs) {
+		printf("--- edge %d -> %d\n",
+		       current->index,
+		       e->dest->index);
+		violations_recurse(state,
+				   infos,
+				   e->dest);
 	}
 }
 
@@ -450,7 +468,7 @@ void find_violations(const std::unordered_map<basic_block, block_info>& infos,
 {
 	state initial;
 
-	violations_recurse(initial, infos, start);
+	violations_recurse(&initial, infos, start);
 }
 
 unsigned int tso::execute(function* f) {
