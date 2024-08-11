@@ -154,6 +154,7 @@ simple_text_label PREVIOUSLY_TRACKED{"previously tracked here"};
 simple_text_label NEWLY_TRACKED{"newly tracked here"};
 simple_text_label PREVIOUSLY_UNTRACKED{"previously untracked here"};
 simple_text_label NEWLY_UNTRACKED{"newly untracked here"};
+simple_text_label PREVIOUSLY_DECLARED{"variable declared here"};
 
 struct block_info {
 	std::vector<variable> newly_tracked;   // first encounter = tracked
@@ -472,6 +473,10 @@ void inconsistent_tracking_error(
 	loc.add_range(untracked_loc,
 		      SHOW_LINES_WITHOUT_RANGE,
 		      &PREVIOUSLY_UNTRACKED);
+
+	loc.add_range(DECL_SOURCE_LOCATION(var),
+		      SHOW_LINES_WITHOUT_RANGE,
+		      &PREVIOUSLY_DECLARED);
 
 	error_at(&loc,
 		 "Inconsistent tracking status of variable %s; only sometimes tracked at some (not this) point",
