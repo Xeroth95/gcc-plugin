@@ -15,6 +15,7 @@
 #include <tree-pass.h>
 #include <print-tree.h>
 #include <line-map.h>
+#include <langhooks.h>
 
 #include <gimple.h>
 #include <gimple-expr.h>
@@ -52,6 +53,21 @@ public:
 	unsigned int execute(function* f) override;
 };
 
+tree functype;
+
+void define_builtins(void*, void*)
+{
+	// this doesnt really work.  We want builtin functions with types
+	// T->T and T->void, but this does not seem to be possible.
+	// NULL_TREE = varargs end
+	// tree type = build_function_type_list(void_type_node, NULL_TREE);
+
+	// functype = add_builtin_function("f", type, 0,
+	// 			       BUILT_IN_MD,
+	// 			       NULL,
+	// 			       NULL_TREE);
+}
+
 int plugin_init(plugin_name_args *plugin_info, plugin_gcc_version *version)
 {
 	pass_data new_pass_data = {
@@ -83,6 +99,10 @@ int plugin_init(plugin_name_args *plugin_info, plugin_gcc_version *version)
 
 	register_callback(plugin_info->base_name, PLUGIN_PASS_MANAGER_SETUP,
 			  nullptr, &tracker_pass);
+
+	register_callback(plugin_info->base_name, PLUGIN_START_UNIT,
+			  define_builtins, NULL);
+
 
 	printf("Plugin initialized ...\n");
 	return 0;
@@ -155,6 +175,7 @@ simple_text_label NEWLY_TRACKED{"newly tracked here"};
 simple_text_label PREVIOUSLY_UNTRACKED{"previously untracked here"};
 simple_text_label NEWLY_UNTRACKED{"newly untracked here"};
 simple_text_label PREVIOUSLY_DECLARED{"variable declared here"};
+simple_text_label RETURNED_FROM{"returned from here"};
 
 struct block_info {
 	std::vector<variable> newly_tracked;   // first encounter = tracked
@@ -236,6 +257,7 @@ struct block_info {
 
 struct context {
 	ident track, untrack;
+	ident replace;
 };
 
 bool is_variable(tree t)
@@ -327,6 +349,21 @@ void handle_gimple(block_info& current, gimple* st, const context& ctx)
 		} else if (name == ctx.untrack) {
 			printf("found untrack\n");
 			stop_tracking(current, st);
+		} else if (name == ctx.replace) {
+			unsigned num_args = gimple_call_num_args(st);
+			if (num_args == 1) {
+				tree lhs = gimple_call_lhs(st);
+				gimple_stmt_iterator gsi = gsi_for_stmt(st);
+				gimple_set_no_warning(st, true);
+				if (lhs == NULL_TREE) {
+					gsi_remove(&gsi, true);
+				} else {
+					tree rhs = gimple_call_arg(st, 0);
+					gassign* assign = gimple_build_assign(lhs, rhs);
+					gsi_replace(&gsi, assign, true);
+				}
+				//update_stmt_if_modified(st);
+			}
 		}
 
 
@@ -386,25 +423,37 @@ struct state {
 
 std::pair<location_t, location_t> block_bounds(basic_block b)
 {
-	location_t start{}, end{};
-
-	bool first = true;
+	location_t start{UNKNOWN_LOCATION}, end{UNKNOWN_LOCATION};
 
 	for (gimple_stmt_iterator si = gsi_start_bb(b);
 	     !gsi_end_p(si); gsi_next(&si)) {
 		gimple* stmt = gsi_stmt(si);
 
-		if (first) {
-			start = gimple_location(stmt);
-			first = false;
+		location_t loc = gimple_location(stmt);
+
+		debug_stmt(stmt);
+		printf("  -> loc = %u\n", loc);
+
+		if (loc == UNKNOWN_LOCATION) {
+			continue;
 		}
 
-		end = gimple_location(stmt);
+		if (start == UNKNOWN_LOCATION) {
+			start = loc;
+		}
+
+		end = loc;
 	}
 	// for (block_stmt_iterator si = bsi_start(b);
 	//      !bsi_end_p(si); bsi_next(&si)) {
 	// }
 	return { start, end };
+}
+
+location_t block_end(basic_block b)
+{
+	auto [_, end] = block_bounds(b);
+	return end;
 }
 
 location_t block_start(basic_block b)
@@ -485,10 +534,15 @@ void inconsistent_tracking_error(
 
 void violations_recurse(std::vector<state> stack,
 			const std::unordered_map<basic_block, block_info>& infos,
-			basic_block current)
+                        // we come enter 'current' from 'from'
+			basic_block from,
+			basic_block current,
+			basic_block end)
 {
 	assert(stack.size() > 0);
 	auto& last = stack.back();
+
+	// check for reentry into the same block
 	for (size_t i = 0; i < stack.size() - 1; ++i) {
 		auto& parent = stack[i];
 		auto& child  = stack[i+1];
@@ -522,13 +576,14 @@ void violations_recurse(std::vector<state> stack,
 
 				// todo: this needs to be a different function
 				//       think about what is actually happening here
-				location_t untrack_pos = last_untrack_pos(stack,
-									  key,
-									  infos);
 
-				inconsistent_tracking_error(current, key,
-							    location,
-							    untrack_pos);
+				// location_t untrack_pos = last_untrack_pos(stack,
+				// 					  key,
+				// 					  infos);
+
+				// inconsistent_tracking_error(current, key,
+				// 			    location,
+				// 			    untrack_pos);
 
 				return;
 			}
@@ -603,24 +658,83 @@ void violations_recurse(std::vector<state> stack,
 		}
 	}
 
-	// TODO: if reached end, make sure that nothing is still tracked
+	// if reached end, make sure that nothing is still tracked
+	if (current == end) {
+		// TODO: instead of checking this just at the end block,
+		//       we should check this for each declaration when it
+		//       goes out of scope
 
-	edge e;
-	edge_iterator ei;
-	FOR_EACH_EDGE(e, ei, current->succs) {
-		printf("--- edge %d -> %d\n",
-		       current->index,
-		       e->dest->index);
-		violations_recurse(stack,
-				   infos,
-				   e->dest);
+		// 0: int f() {
+		// 1: 	{
+		// 2: 		int x;
+		// 3: 		track(x);
+		// 4: 	}
+		// 5: 	return 3;
+		// 6: }
+
+		// currently we report the error at 5, when we should do so
+		// at 4
+
+		// for this we need to find out which declaration belongs to
+		// which basic_block.
+		// This could be done with a tree -> basic_block function
+		// if such a thing exists
+
+
+		for (auto [var, tracked_loc] : last.tracked) {
+
+			rich_location loc{
+				nullptr, tracked_loc, &PREVIOUSLY_TRACKED
+			};
+
+			loc.add_range(DECL_SOURCE_LOCATION(var),
+				      SHOW_LINES_WITHOUT_RANGE,
+				      &PREVIOUSLY_DECLARED);
+
+			for (auto& b : stack) {
+				printf("block: %d\n", b.block->index);
+			}
+
+			printf("stack size = %zu\n", stack.size());
+
+			// maybe we should use the goto_locus for
+			// the edge here
+
+			location_t end = block_end(from);
+
+			loc.add_range(end,
+				      SHOW_LINES_WITHOUT_RANGE,
+				      &RETURNED_FROM);
+
+			error_at(&loc,
+				 "did not untrack %qD at before returning (last = %d) %u",
+				 var, from->index, end);
+		}
+	} else {
+		edge e;
+		edge_iterator ei;
+		auto current_size = stack.size();
+		FOR_EACH_EDGE(e, ei, current->succs) {
+			printf("--- edge %d -> %d\n",
+			       current->index,
+			       e->dest->index);
+
+
+			// reset stack for new path
+			stack.resize(current_size);
+			violations_recurse(stack,
+					   infos,
+					   current,
+					   e->dest,
+					   end);
+		}
 	}
 }
 
 
 
 void find_violations(const std::unordered_map<basic_block, block_info>& infos,
-		     basic_block start)
+		     basic_block start, basic_block end)
 {
 	std::vector<state> stack;
 	auto& initial = stack.emplace_back();
@@ -633,9 +747,9 @@ void find_violations(const std::unordered_map<basic_block, block_info>& infos,
 		printf("--- edge %d -> %d\n",
 		       start->index,
 		       e->dest->index);
-		violations_recurse(stack,
-				   infos,
-				   e->dest);
+		stack.resize(1);
+		violations_recurse(stack, infos,
+				   start, e->dest, end);
 	}
 }
 
@@ -644,6 +758,7 @@ unsigned int tso::execute(function* f) {
 
 	auto track = maybe_get_identifier("track");
 	auto untrack = maybe_get_identifier("untrack");
+	auto fun = maybe_get_identifier("f");
 
 	if (track == NULL_TREE) {
 		printf("no track defined\n");
@@ -653,10 +768,14 @@ unsigned int tso::execute(function* f) {
 		printf("no untrack defined\n");
 		return 1;
 	}
+	if (fun == NULL_TREE) {
+		printf("no f defined");
+	}
 
 	context ctx;
 	ctx.track = track;
 	ctx.untrack = untrack;
+	ctx.replace = fun;
 
 	tree decl = f->decl;
 	const std::string ident{fndecl_name(decl)};
@@ -668,7 +787,7 @@ unsigned int tso::execute(function* f) {
 	std::unordered_map<basic_block, block_info> block_infos =
 		build_block_infos(start, end, ctx);
 
-	find_violations(block_infos, start);
+	find_violations(block_infos, start, end);
 
 	return 0;
 }
