@@ -9,6 +9,7 @@
 
 #include <gcc-plugin.h>
 #include <plugin-version.h>
+#include <c-tree.h>
 
 #include <context.h>
 #include <tree.h>
@@ -30,9 +31,6 @@
 #include <tree-pass.h>
 
 #include <stringpool.h>
-
-
-int i = (location_t) 0;
 
 int plugin_is_GPL_compatible;
 
@@ -57,15 +55,24 @@ tree functype;
 
 void define_builtins(void*, void*)
 {
-	// this doesnt really work.  We want builtin functions with types
-	// T->T and T->void, but this does not seem to be possible.
-	// NULL_TREE = varargs end
-	// tree type = build_function_type_list(void_type_node, NULL_TREE);
+	// this seems to work, sadly we cannot make untrack return its
+	//
+	tree track_id = get_identifier("__plugin_track_variable");
+	tree untrack_id = get_identifier("__plugin_untrack_variable");
+	tree type = build_varargs_function_type_list(void_type_node, NULL_TREE);
 
-	// functype = add_builtin_function("f", type, 0,
-	// 			       BUILT_IN_MD,
-	// 			       NULL,
-	// 			       NULL_TREE);
+	tree track = build_decl(UNKNOWN_LOCATION, FUNCTION_DECL, track_id, type);
+	tree untrack = build_decl(UNKNOWN_LOCATION, FUNCTION_DECL, untrack_id, type);
+
+	TREE_PUBLIC(track) = 1;
+	DECL_EXTERNAL(track) = 1;
+
+	pushdecl(track);
+
+	TREE_PUBLIC(untrack) = 1;
+	DECL_EXTERNAL(untrack) = 1;
+
+	pushdecl(untrack);
 }
 
 int plugin_init(plugin_name_args *plugin_info, plugin_gcc_version *version)
@@ -103,6 +110,17 @@ int plugin_init(plugin_name_args *plugin_info, plugin_gcc_version *version)
 	register_callback(plugin_info->base_name, PLUGIN_START_UNIT,
 			  define_builtins, NULL);
 
+
+// // Macros provided for convenience.
+// #ifdef __has_feature
+// #if __has_feature(address_sanitizer)
+// #define ASAN_DEFINE_REGION_MACROS
+// #endif
+// #elif defined(__SANITIZE_ADDRESS__)
+// #define ASAN_DEFINE_REGION_MACROS
+// #endif
+
+	c_common_register_feature("variable_tracking", true);
 
 	printf("Plugin initialized ...\n");
 	return 0;
@@ -202,7 +220,6 @@ struct block_info {
 
 		auto& status = found->second;
 		if (status.tracked) {
-
 			rich_location location{
 				nullptr, loc, &NEWLY_TRACKED
 			};
@@ -293,6 +310,12 @@ void start_tracking(block_info& current,
 		return;
 	}
 
+//	tree block = TREE_BLOCK(arg);
+
+//	printf("location = %d\n", EXPR_LOCATION(block));
+
+	// error_at(EXPR_LOCATION(arg), "Oh oh");
+
 	current.track(loc, arg);
 
 	auto name = DECL_NAME(arg);
@@ -329,12 +352,9 @@ void stop_tracking(block_info& current, gimple* st)
 void handle_gimple(block_info& current, gimple* st, const context& ctx)
 {
 	debug_stmt(st);
-	auto code = gimple_code(st);
 
-	if (code == GIMPLE_CALL) {
+	if (is_gimple_call(st)) {
 		// search for track/untrack
-
-
 
 		tree fdecl = gimple_call_fndecl(st); // TREE_CODE() = FUNCTION_DECL
 
@@ -377,6 +397,17 @@ void handle_gimple(block_info& current, gimple* st, const context& ctx)
 		// 		  );
 		// 	//printf("One found\n");
 		// }
+	}
+
+	if (gimple_clobber_p(st)) {
+		// a clobber is always an assign, think of
+		// var = CLOBBER;
+		tree var = gimple_assign_lhs(st);
+
+
+
+		printf(" CLOBBER %s \n", IDENTIFIER_POINTER(var));
+
 	}
 
 	// walk_stmt_info wi;
@@ -674,6 +705,9 @@ void violations_recurse(std::vector<state> stack,
 
 		// currently we report the error at 5, when we should do so
 		// at 4
+
+		// apperently gcc inserts "CLOBBERS" at the end of the lifetime
+		// This does not always happen though.
 
 		// for this we need to find out which declaration belongs to
 		// which basic_block.

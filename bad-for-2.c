@@ -1,5 +1,5 @@
-void track(int) {}
-int untrack(int x) { return x; }
+/* void track(int) {} */
+/* int untrack(int x) { return x; } */
 
 int main(int argc, char* argv[])
 {
