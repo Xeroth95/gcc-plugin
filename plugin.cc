@@ -51,28 +51,54 @@ public:
 	unsigned int execute(function* f) override;
 };
 
-tree functype;
+// use ident if we know that its an IDENTIFIER_NODE
+using ident = tree;
+
+ident track_id = NULL_TREE;
+ident untrack_id = NULL_TREE;
+
+struct my_rich_location : public rich_location {
+	explicit my_rich_location (location_t loc, const range_label *label = NULL)
+		: rich_location(line_table, loc, label)
+		{}
+};
 
 void define_builtins(void*, void*)
 {
 	// this seems to work, sadly we cannot make untrack return its
 	//
-	tree track_id = get_identifier("__plugin_track_variable");
-	tree untrack_id = get_identifier("__plugin_untrack_variable");
-	tree type = build_varargs_function_type_list(void_type_node, NULL_TREE);
+	track_id = get_identifier("__plugin_track_variable");
+	untrack_id = get_identifier("__plugin_untrack_variable");
+	// tree type = build_varargs_function_type_list(void_type_node, NULL_TREE);
 
-	tree track = build_decl(UNKNOWN_LOCATION, FUNCTION_DECL, track_id, type);
-	tree untrack = build_decl(UNKNOWN_LOCATION, FUNCTION_DECL, untrack_id, type);
+	// tree track = build_decl(UNKNOWN_LOCATION, FUNCTION_DECL, track_id, type);
+	// tree untrack = build_decl(UNKNOWN_LOCATION, FUNCTION_DECL, untrack_id, type);
 
-	TREE_PUBLIC(track) = 1;
-	DECL_EXTERNAL(track) = 1;
+	// TREE_PUBLIC(track) = 1;
+	// DECL_EXTERNAL(track) = 1;
 
-	pushdecl(track);
+	// pushdecl(track);
 
-	TREE_PUBLIC(untrack) = 1;
-	DECL_EXTERNAL(untrack) = 1;
+	// TREE_PUBLIC(untrack) = 1;
+	// DECL_EXTERNAL(untrack) = 1;
 
-	pushdecl(untrack);
+	// pushdecl(untrack);
+}
+
+void define_features(void*, void*)
+{
+	bool feature = true;
+	// not sure what the real way to do this but we somehow need to
+	// call the static function `init_has_feature()` before registering
+	// features.  As the function is static this is not possible directly,
+	// but we can take advantage of the fact that `has_feature_p` has to
+        // initialize the features before checking for availability.  This
+	// is why we call it here.  I guess we should maybe throw an error
+	// if this feature already exists somehow ??
+
+	if (!has_feature_p("variable_tracking", feature)) {
+		c_common_register_feature("variable_tracking", feature);
+	}
 }
 
 int plugin_init(plugin_name_args *plugin_info, plugin_gcc_version *version)
@@ -110,6 +136,9 @@ int plugin_init(plugin_name_args *plugin_info, plugin_gcc_version *version)
 	register_callback(plugin_info->base_name, PLUGIN_START_UNIT,
 			  define_builtins, NULL);
 
+	register_callback(plugin_info->base_name, PLUGIN_START_UNIT,
+			  define_features, NULL);
+
 
 // // Macros provided for convenience.
 // #ifdef __has_feature
@@ -119,8 +148,6 @@ int plugin_init(plugin_name_args *plugin_info, plugin_gcc_version *version)
 // #elif defined(__SANITIZE_ADDRESS__)
 // #define ASAN_DEFINE_REGION_MACROS
 // #endif
-
-	c_common_register_feature("variable_tracking", true);
 
 	printf("Plugin initialized ...\n");
 	return 0;
@@ -151,7 +178,7 @@ debug_func(function *f)
 	size_t sz = ident.size() + file.size() + top_file.size() + 3;
 	size_t n = sz > 70 ? 10 : 80 - sz;
 
-	std::cerr << std::string(n, '-') << " " << top_file << ":" << file <<
+	std::cout << std::string(n, '-') << " " << top_file << ":" << file <<
 			":" << ident << std::endl;
 }
 
@@ -160,14 +187,11 @@ debug_stmt(/* const */ gimple* st)
 {
 	enum gimple_code code = gimple_code(st);
 
-	std::cerr << "- " << code;
+	std::cout << "- " << code;
 
-	std::cerr << " | ";
+	std::cout << " | ";
 	debug_gimple_stmt(st);
 }
-
-// use ident if we know that its an IDENTIFIER_NODE
-using ident = tree;
 
 struct variable {
 	tree id;
@@ -190,6 +214,8 @@ struct simple_text_label : public range_label {
 
 simple_text_label PREVIOUSLY_TRACKED{"previously tracked here"};
 simple_text_label NEWLY_TRACKED{"newly tracked here"};
+simple_text_label UNTRACKED{"not tracked here"};
+simple_text_label TRACKED{"tracked here"};
 simple_text_label PREVIOUSLY_UNTRACKED{"previously untracked here"};
 simple_text_label NEWLY_UNTRACKED{"newly untracked here"};
 simple_text_label PREVIOUSLY_DECLARED{"variable declared here"};
@@ -220,17 +246,14 @@ struct block_info {
 
 		auto& status = found->second;
 		if (status.tracked) {
-			rich_location location{
-				nullptr, loc, &NEWLY_TRACKED
-			};
+			my_rich_location location{loc, &NEWLY_TRACKED};
 
 			location.add_range(status.last_changed,
 					   SHOW_LINES_WITHOUT_RANGE,
-					   &PREVIOUSLY_TRACKED
-					  );
+					   &PREVIOUSLY_TRACKED);
 
 
-			error_at(&location,
+			error_at(loc, // &location
 				 "trying to track currently tracked variable");
 			return;
 		} else {
@@ -254,9 +277,7 @@ struct block_info {
 		auto& status = found->second;
 
 		if (!status.tracked) {
-			rich_location location{
-				nullptr, loc, &NEWLY_UNTRACKED
-			};
+			my_rich_location location{loc, &NEWLY_UNTRACKED};
 
 			location.add_range(status.last_changed,
 					   SHOW_LINES_WITHOUT_RANGE,
@@ -274,7 +295,6 @@ struct block_info {
 
 struct context {
 	ident track, untrack;
-	ident replace;
 };
 
 bool is_variable(tree t)
@@ -349,8 +369,10 @@ void stop_tracking(block_info& current, gimple* st)
 	printf("untracking %s\n", IDENTIFIER_POINTER(name));
 }
 
-void handle_gimple(block_info& current, gimple* st, const context& ctx)
+void handle_gimple(block_info& current, gimple_stmt_iterator si, const context& ctx)
 {
+	gimple* st = gsi_stmt(si);
+
 	debug_stmt(st);
 
 	if (is_gimple_call(st)) {
@@ -363,28 +385,29 @@ void handle_gimple(block_info& current, gimple* st, const context& ctx)
 		printf("name = %s\n", IDENTIFIER_POINTER(name));
 		if (name == ctx.track) {
 			printf("found track\n");
-
 			start_tracking(current, st);
-
+			gsi_replace(&si, gimple_build_nop(), true);
 		} else if (name == ctx.untrack) {
 			printf("found untrack\n");
 			stop_tracking(current, st);
-		} else if (name == ctx.replace) {
-			unsigned num_args = gimple_call_num_args(st);
-			if (num_args == 1) {
-				tree lhs = gimple_call_lhs(st);
-				gimple_stmt_iterator gsi = gsi_for_stmt(st);
-				gimple_set_no_warning(st, true);
-				if (lhs == NULL_TREE) {
-					gsi_remove(&gsi, true);
-				} else {
-					tree rhs = gimple_call_arg(st, 0);
-					gassign* assign = gimple_build_assign(lhs, rhs);
-					gsi_replace(&gsi, assign, true);
-				}
-				//update_stmt_if_modified(st);
-			}
+			gsi_replace(&si, gimple_build_nop(), true);
 		}
+		// } else if (name == ctx.replace) {
+		// 	unsigned num_args = gimple_call_num_args(st);
+		// 	if (num_args == 1) {
+		// 		tree lhs = gimple_call_lhs(st);
+		// 		gimple_stmt_iterator gsi = gsi_for_stmt(st);
+		// 		gimple_set_no_warning(st, true);
+		// 		if (lhs == NULL_TREE) {
+		// 			gsi_remove(&gsi, true);
+		// 		} else {
+		// 			tree rhs = gimple_call_arg(st, 0);
+		// 			gassign* assign = gimple_build_assign(lhs, rhs);
+		// 			gsi_replace(&gsi, assign, true);
+		// 		}
+		// 		//update_stmt_if_modified(st);
+		// 	}
+		// }
 
 
 
@@ -402,9 +425,8 @@ void handle_gimple(block_info& current, gimple* st, const context& ctx)
 	if (gimple_clobber_p(st)) {
 		// a clobber is always an assign, think of
 		// var = CLOBBER;
+		// sadly this is never hit ...
 		tree var = gimple_assign_lhs(st);
-
-
 
 		printf(" CLOBBER %s \n", IDENTIFIER_POINTER(var));
 
@@ -432,9 +454,7 @@ std::unordered_map<basic_block, block_info> build_block_infos(
 		printf("---  start block %d --- \n", current->index);
 		for (gimple_stmt_iterator si = gsi_start_bb(current);
 		     !gsi_end_p(si); gsi_next(&si)) {
-			gimple* stmt = gsi_stmt(si);
-
-			handle_gimple(info, stmt, ctx);
+			handle_gimple(info, si, ctx);
 		}
 		printf("---  end block %d --- \n", current->index);
 
@@ -451,6 +471,25 @@ struct state {
 	std::unordered_map<tree, location_t> tracked;
 	basic_block block{nullptr};
 };
+
+std::string print_stack(std::span<const state> stack)
+{
+	std::string result = "[";
+
+	for (size_t i = 0; i < stack.size(); ++i) {
+		if (i != 0) {
+			result += ", ";
+		} else {
+			result += " ";
+		}
+		result += std::to_string(stack[i].block->index);
+	}
+
+	if (stack.size() != 0) { result += " "; }
+	result += "]";
+	return result;
+}
+
 
 std::pair<location_t, location_t> block_bounds(basic_block b)
 {
@@ -487,6 +526,12 @@ location_t block_end(basic_block b)
 	return end;
 }
 
+location_t block_begin(basic_block b)
+{
+	auto [begin, _] = block_bounds(b);
+	return begin;
+}
+
 location_t block_start(basic_block b)
 {
 	for (gimple_stmt_iterator si = gsi_start_bb(b);
@@ -498,6 +543,47 @@ location_t block_start(basic_block b)
 			return loc;
 		}
 	}
+	return UNKNOWN_LOCATION;
+}
+
+location_t last_track_pos(std::span<const state> stack,
+			    tree var,
+			    const std::unordered_map<basic_block, block_info>& infos)
+{
+	for (size_t i = stack.size(); i > 0;) {
+
+		i -= 1;
+
+		auto& state = stack[i];
+		basic_block block = state.block;
+		auto& info = infos.at(block);
+
+		auto found = info.seen.find(var);
+
+		if (found == info.seen.end()) { continue; }
+
+		auto& status = found->second;
+
+		if (!status.tracked) {
+
+			tree name = DECL_NAME(var);
+			fprintf(stderr, "bad var %s: traceback %s\n", IDENTIFIER_POINTER(name), print_stack(stack).c_str());
+
+
+			assert(!"supposed untracked variable is somehow last seen as tracked");
+		}
+
+
+		// so this variable was last seen in this block
+		// and it is untracked, so we know that the last time it was
+
+		return status.last_changed;
+
+
+	}
+
+	// this should not happen
+
 	return UNKNOWN_LOCATION;
 }
 
@@ -518,8 +604,16 @@ location_t last_untrack_pos(std::span<const state> stack,
 		if (found == info.seen.end()) { continue; }
 
 		auto& status = found->second;
-		assert(!status.tracked &&
-		       "supposed untracked variable is somehow last seen as tracked");
+
+		if (status.tracked) {
+
+			tree name = DECL_NAME(var);
+			fprintf(stderr, "bad var %s: traceback %s\n", IDENTIFIER_POINTER(name), print_stack(stack).c_str());
+
+
+			assert(!"supposed untracked variable is somehow last seen as tracked");
+		}
+
 
 		// so this variable was last seen in this block
 		// and it is untracked, so we know that the last time it was
@@ -529,8 +623,6 @@ location_t last_untrack_pos(std::span<const state> stack,
 	}
 
 	// this should not happen
-
-	assert(!"Untracked var was never untracked !?");
 
 	return UNKNOWN_LOCATION;
 }
@@ -544,7 +636,7 @@ void inconsistent_tracking_error(
 	auto start = block_start(b);
 	ident name = DECL_NAME(var);
 
-	rich_location loc{ nullptr, start, nullptr };
+	my_rich_location loc{ start, nullptr };
 
 	loc.add_range(tracked_loc,
 		      SHOW_LINES_WITHOUT_RANGE,
@@ -574,12 +666,24 @@ void violations_recurse(std::vector<state> stack,
 	auto& last = stack.back();
 
 	// check for reentry into the same block
+	printf("checking for reentry into %p (%d)\n", current, current->index);
+	printf("  stack = %s\n", print_stack(stack).c_str());
 	for (size_t i = 0; i < stack.size() - 1; ++i) {
 		auto& parent = stack[i];
 		auto& child  = stack[i+1];
+
+		printf(" child = %p (%d)\n", child.block, child.block->index);
+		printf(" parent = %p (%d)\n", parent.block, parent.block->index);
+
 		if (child.block != current) {
+			printf("  -> not same (child != current)\n");
+
+
 			continue;
 		}
+
+		printf("reached %p (%d) again (child == current)\n",
+		       current, current->index);
 
 		// so we already reached this point.  We need to make sure
 		// that the same variables are currently tracked, so that
@@ -605,16 +709,28 @@ void violations_recurse(std::vector<state> stack,
 				// the track in last->block
 				// the untrack in b
 
-				// todo: this needs to be a different function
-				//       think about what is actually happening here
+				my_rich_location loc{ block_begin(current), nullptr };
+				// loc.add_range(last_track_pos(std::span(stack.begin() + i, // parent loc
+				// 				       stack.end()),
+				// 			     key, infos),
+				// 	      SHOW_LINES_WITHOUT_RANGE,
+				// 	      &NEWLY_TRACKED);
+				loc.add_range(block_end(parent.block),
+					      SHOW_LINES_WITHOUT_RANGE,
+					      &UNTRACKED);
+				loc.add_range(block_end(last.block),
+					      SHOW_LINES_WITHOUT_RANGE,
+					      &TRACKED);
 
-				// location_t untrack_pos = last_untrack_pos(stack,
-				// 					  key,
-				// 					  infos);
+				error_at(&loc,
+					 "inconsistent tracking status of %qD at point",
+					 key);
 
-				// inconsistent_tracking_error(current, key,
-				// 			    location,
-				// 			    untrack_pos);
+				// does not seem to work when adding this location
+				// as range, so report it seperately
+				error_at(last_track_pos(std::span(stack.begin() + i, // parent loc
+								       stack.end()),
+							     key, infos), "inconsistency caused by this track");
 
 				return;
 			}
@@ -629,6 +745,9 @@ void violations_recurse(std::vector<state> stack,
 						    var,
 						    parent.tracked[var],
 						    untrack_pos);
+
+			printf("inconsistent tracking error\n");
+
 			return;
 		}
 
@@ -645,10 +764,8 @@ void violations_recurse(std::vector<state> stack,
 			auto found = last.tracked.find(varloc.id);
 
 			if (found != last.tracked.end()) {
-				// TODO: error backtrace
-
-				rich_location location{
-					nullptr, varloc.loc, &NEWLY_TRACKED
+				my_rich_location location{
+					varloc.loc, &NEWLY_TRACKED
 				};
 
 				location.add_range(found->second,
@@ -664,10 +781,13 @@ void violations_recurse(std::vector<state> stack,
 			auto found = last.tracked.find(varloc.id);
 
 			if (found == last.tracked.end()) {
+				printf("untracking not tracked\n");
+				printf("  stack = %s\n", print_stack(stack).c_str());
+				printf("  current = %d\n", current->index);
+
+
 				// error (backtrack)
-				rich_location location{
-					nullptr, varloc.loc, &NEWLY_UNTRACKED
-				};
+				my_rich_location location{varloc.loc, &NEWLY_UNTRACKED};
 
 				error_at(&location,
 					 "Cannot untrack variable that is not tracked");
@@ -687,6 +807,9 @@ void violations_recurse(std::vector<state> stack,
 			}
 
 		}
+	} else {
+		auto& state = stack.emplace_back(last);
+		state.block = current;
 	}
 
 	// if reached end, make sure that nothing is still tracked
@@ -714,35 +837,31 @@ void violations_recurse(std::vector<state> stack,
 		// This could be done with a tree -> basic_block function
 		// if such a thing exists
 
+		// printf("reached end with %zu tracked vars\n", last.tracked.size());
+		// return;
 
 		for (auto [var, tracked_loc] : last.tracked) {
 
-			rich_location loc{
-				nullptr, tracked_loc, &PREVIOUSLY_TRACKED
+			my_rich_location loc{
+				tracked_loc, &TRACKED
 			};
 
 			loc.add_range(DECL_SOURCE_LOCATION(var),
 				      SHOW_LINES_WITHOUT_RANGE,
 				      &PREVIOUSLY_DECLARED);
 
-			for (auto& b : stack) {
-				printf("block: %d\n", b.block->index);
-			}
-
-			printf("stack size = %zu\n", stack.size());
-
 			// maybe we should use the goto_locus for
 			// the edge here
 
-			location_t end = block_end(from);
+			location_t endloc = block_end(from);
 
-			loc.add_range(end,
+			loc.add_range(endloc,
 				      SHOW_LINES_WITHOUT_RANGE,
 				      &RETURNED_FROM);
 
 			error_at(&loc,
-				 "did not untrack %qD at before returning (last = %d) %u",
-				 var, from->index, end);
+				 "did not untrack %qD before returning (last = %d) %u",
+				 var, from->index, endloc);
 		}
 	} else {
 		edge e;
@@ -764,8 +883,6 @@ void violations_recurse(std::vector<state> stack,
 		}
 	}
 }
-
-
 
 void find_violations(const std::unordered_map<basic_block, block_info>& infos,
 		     basic_block start, basic_block end)
@@ -790,26 +907,21 @@ void find_violations(const std::unordered_map<basic_block, block_info>& infos,
 unsigned int tso::execute(function* f) {
 	debug_func(f);
 
-	auto track = maybe_get_identifier("track");
-	auto untrack = maybe_get_identifier("untrack");
-	auto fun = maybe_get_identifier("f");
+	// auto track = maybe_get_identifier("track");
+	// auto untrack = maybe_get_identifier("untrack");
 
-	if (track == NULL_TREE) {
-		printf("no track defined\n");
-		return 1;
-	}
-	if (untrack == NULL_TREE) {
-		printf("no untrack defined\n");
-		return 1;
-	}
-	if (fun == NULL_TREE) {
-		printf("no f defined");
-	}
+	// if (track == NULL_TREE) {
+	// 	printf("no track defined\n");
+	// 	return 1;
+	// }
+	// if (untrack == NULL_TREE) {
+	// 	printf("no untrack defined\n");
+	// 	return 1;
+	// }
 
 	context ctx;
-	ctx.track = track;
-	ctx.untrack = untrack;
-	ctx.replace = fun;
+	ctx.track = track_id;
+	ctx.untrack = untrack_id;
 
 	tree decl = f->decl;
 	const std::string ident{fndecl_name(decl)};
@@ -822,6 +934,8 @@ unsigned int tso::execute(function* f) {
 		build_block_infos(start, end, ctx);
 
 	find_violations(block_infos, start, end);
+
+	printf("finished finding violations in %s...\n", ident.c_str());
 
 	return 0;
 }

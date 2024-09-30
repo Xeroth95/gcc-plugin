@@ -1,16 +1,15 @@
-void track(int) {}
-int untrack(int x) { return x; }
+#include "track.h"
 
 int f() { return 3; };
 
 int main(int argc, char* argv[])
 {
 	int x = 3;
-	track(x);
+	TRACK(x);
 	{
 		int x = argc;
 		// track(x);
-		track(x);
+		TRACK(x);
 		//track(1);
 		if (argc) {
 			// comment
@@ -19,15 +18,21 @@ int main(int argc, char* argv[])
 		}
 		x = f();
 		//untrack(untrack(x));
-		untrack(x);
+		UNTRACK(x);
 	}
 
 	int y = 2;
 	for (int i = 0; i < 10; ++i) {
-		track(y);
+		TRACK(y);
 	}
-	untrack(y);
+	UNTRACK(y);
 
-	untrack(x);
+	UNTRACK(x);
+
+	{
+		int x;
+		TRACK(x);
+	}
+
 	return 0;
 }
